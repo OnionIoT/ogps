@@ -13,7 +13,7 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307, USA.
  *
- *   Copyright (C) 2014 John Crispin <blogic@openwrt.org> 
+ *   Copyright (C) 2014 John Crispin <blogic@openwrt.org>
  */
 
 #define _BSD_SOURCE
@@ -30,6 +30,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <errno.h>
+#include <math.h>
 
 #include <string.h>
 #include <termios.h>
@@ -40,28 +42,16 @@
 #include "nmea.h"
 
 #define MAX_NMEA_PARAM	20
-#define MAX_TIME_OFFSET	2
+#define MAX_TIME_OFFSET	5
 #define MAX_BAD_TIME	3
-#define MAX_NUM_LENGTH 12
-
-
 
 struct nmea_param {
 	char *str;
 	int num;
 } nmea_params[MAX_NMEA_PARAM];
 
-
-void createMemParam(void) {
-	int j;
-	for ( j=0; j < MAX_NMEA_PARAM; j++){
-	nmea_params[j].str = (char *)malloc(13);
-	}
-}
-
-
 static int nmea_bad_time;
-char longitude[32] = { 0 }, latitude[32] = { 0 }, course[16] = { 0 }, speed[16] = { 0 }, elivation[16] = { 0 };
+char longitude[32] = { 0 }, latitude[32] = { 0 }, course[16] = { 0 }, speed[16] = { 0 }, elevation[16] = { 0 };
 int gps_valid = 0;
 
 static void
@@ -72,7 +62,7 @@ nmea_txt_cb(void)
 	if (nmea_params[3].num < 0 || nmea_params[3].num > 2)
 		nmea_params[3].num = 0;
 
-	LOG("%s: %s\n", ids[nmea_params[3].num], nmea_params[4].str);
+	DEBUG(3, "%s: %s\n", ids[nmea_params[3].num], nmea_params[4].str);
 }
 
 static void
@@ -83,7 +73,7 @@ nmea_rmc_cb(void)
 
 	if (*nmea_params[2].str != 'A') {
 		gps_valid = 0;
-		fprintf(stderr, "waiting for valid signal\n");
+		DEBUG(4, "waiting for valid signal\n");
 		return;
 	}
 
@@ -91,77 +81,65 @@ nmea_rmc_cb(void)
 	memset(&tm, 0, sizeof(tm));
 	tm.tm_isdst = 1;
 
-	if (!strptime(nmea_params[1].str, "%H%M%S", &tm))
-		ERROR("failed to parse time\n");
-	else if (!strptime(nmea_params[9].str, "%d%m%y", &tm))
-		ERROR("failed to parse date\n");
+	if (sscanf(nmea_params[1].str, "%02d%02d%02d",
+		&tm.tm_hour, &tm.tm_min, &tm.tm_sec) != 3) {
+		ERROR("failed to parse time '%s'\n", nmea_params[1].str);
+	}
+	else if (sscanf(nmea_params[9].str, "%02d%02d%02d",
+		&tm.tm_mday, &tm.tm_mon, &tm.tm_year) != 3) {
+		ERROR("failed to parse date '%s'\n", nmea_params[9].str);
+	}
 	else {
-		/* is there a libc api for the tz adjustment ? */
-		struct timeval tv = { mktime(&tm), 0 };
-		struct timeval cur;
+		tm.tm_year += 100; /* year starts with 1900 */
+		tm.tm_mon -= 1; /* month starts with 0 */
 
-		strftime(tmp, 256, "%D %02H:%02M:%02S", &tm);
-		LOG("date: %s UTC\n", tmp);
+		strftime(tmp, 256, "%Y-%m-%dT%H:%M:%S", &tm);
+		DEBUG(3, "date: %s UTC\n", tmp);
 
-		tv.tv_sec -= timezone;
-		if (daylight)
-			tv.tv_sec += 3600;
+		if (adjust_clock) {
+			struct timeval tv = { timegm(&tm), 0 };
+			struct timeval cur;
 
-		gettimeofday(&cur, NULL);
+			gettimeofday(&cur, NULL);
 
-		if (abs(cur.tv_sec - tv.tv_sec) > MAX_TIME_OFFSET) {
-			if (++nmea_bad_time > MAX_BAD_TIME) {
-				LOG("system time differs from GPS time by more than %d seconds. Using %s UTC as the new time\n", MAX_TIME_OFFSET, tmp);
-				settimeofday(&tv, NULL);
+			if (abs(cur.tv_sec - tv.tv_sec) > MAX_TIME_OFFSET) {
+				if (++nmea_bad_time > MAX_BAD_TIME) {
+					LOG("system time differs from GPS time by more than %d seconds. Using %s UTC as the new time\n", MAX_TIME_OFFSET, tmp);
+					/* only set datetime if specified by command line argument! */
+					settimeofday(&tv, NULL);
+				}
+			} else {
+				nmea_bad_time = 0;
 			}
-		} else {
-			nmea_bad_time = 0;
 		}
 	}
 
-
-	if (strlen(nmea_params[3].str) != 10 || strlen(nmea_params[5].str) != 11) {
-		printf("lat/lng have invalid string length\n");
+	if (strlen(nmea_params[3].str) < 9 || strlen(nmea_params[5].str) < 10) {
+		ERROR("lat/lng have invalid string length %d<9, %d<10\n",
+		       strlen(nmea_params[3].str), strlen(nmea_params[5].str));
 	} else {
-		int latd, latm, lats;
-		int lngd, lngm, lngs;
-		float flats, flngs;
-		LOG("position: %s, %s\n",
-			nmea_params[3].str, nmea_params[5].str);
+		float minutes;
+		float degrees;
+		float lat = strtof(nmea_params[3].str, NULL);
+		float lon = strtof(nmea_params[5].str, NULL);
 
-		latm = atoi(&nmea_params[3].str[2]);
-		nmea_params[3].str[2] = '\0';
-		latd = atoi(nmea_params[3].str);
-		lats = atoi(&nmea_params[3].str[5]);
-		if (*nmea_params[4].str != 'N'){
-			latm *= 1;
-			latd = latd * -1;
-			}
-		lngm = atoi(&nmea_params[5].str[3]);
-		nmea_params[5].str[3] = '\0';
-		lngd = atoi(nmea_params[5].str);
-		lngs = atoi(&nmea_params[5].str[6]);
-		if (*nmea_params[6].str != 'E'){
-			lngm *= 1;
-			lngd = lngd * -1;
-			}
-		flats = lats;
-		flats *= 60;
-		flats /= 10000;
+		if (*nmea_params[4].str == 'S')
+			lat *= -1.0;
+		if (*nmea_params[6].str == 'W')
+			lon *= -1.0;
 
-		flngs = lngs;
-		flngs *= 60;
-		flngs /= 10000;
+		degrees = floor(lat / 100.0);
+		minutes = lat - (degrees * 100.0);
+		lat = degrees + minutes / 60.0;
 
-#define ms_to_deg(x, y) (((x * 10000) + y) / 60)
+		degrees = floor(lon / 100.0);
+		minutes = lon - (degrees * 100.0);
+		lon = degrees + minutes / 60.0;
 
-		LOG("position: %dÃ‚Â°%d.%04d, %dÃ‚Â°%d.%04d\n",
-			latd, latm, lats, lngd, lngm, lngs);
-		LOG("position: %dÃ‚Â°%d'%.1f\" %dÃ‚Â°%d'%.1f\"\n",
-			latd, latm, flats, lngd, lngm, flngs);
-		snprintf(latitude, sizeof(latitude), "%d.%04d", latd, ms_to_deg(latm, lats));
-		snprintf(longitude, sizeof(longitude), "%d.%04d", lngd, ms_to_deg(lngm, lngs));
-		LOG("position: %s %s\n", latitude, longitude);
+		snprintf(latitude, sizeof(latitude), "%f", lat);
+		snprintf(longitude, sizeof(longitude), "%f", lon);
+
+		DEBUG(3, "position: %s %s\n", latitude, longitude);
 		gps_timestamp();
 	}
 }
@@ -171,8 +149,8 @@ nmea_gga_cb(void)
 {
 	if (!gps_valid)
 		return;
-	strncpy(elivation, nmea_params[9].str, sizeof(elivation));
-	LOG("height: %s\n", elivation);
+	strncpy(elevation, nmea_params[9].str, sizeof(elevation));
+	DEBUG(4, "height: %s\n", elevation);
 }
 
 static void
@@ -181,9 +159,9 @@ nmea_vtg_cb(void)
 	if (!gps_valid)
 		return;
 	strncpy(course, nmea_params[1].str, sizeof(course));
-	strncpy(speed, nmea_params[6].str, sizeof(speed));
-	LOG("course: %s\n", course);
-	LOG("speed: %s\n", speed);
+	strncpy(speed, nmea_params[7].str, sizeof(speed));
+	DEBUG(4, "course: %s\n", course);
+	DEBUG(4, "speed: %s\n", speed);
 }
 
 static struct nmea_msg {
@@ -197,7 +175,7 @@ static struct nmea_msg {
 		.handler = nmea_txt_cb,
 	}, {
 		.msg = "RMC",
-		.cnt = 12,
+		.cnt = 11,
 		.handler = nmea_rmc_cb,
 	}, {
 		.msg = "GGA",
@@ -234,32 +212,20 @@ nmea_verify_checksum(char *s)
 
 static int
 nmea_tokenize(char *msg)
-{	
-	char *comma;
-	char *position;
+{
 	int cnt = 0;
-	//Max number length is 12
-	char number[MAX_NUM_LENGTH + 1];
-	comma = strchr(msg, ',');
-	position= msg;
-	    while (comma) {
-            int i = 0;
-            while (position < comma && i <= MAX_NUM_LENGTH) {
-                number[i] = *position;
-                i++;
-                position++;
-            }
-			number[i] = '\0';
-			strcpy(nmea_params[cnt].str, number);		
-			nmea_params[cnt].num=atoi(number);
-            position++;
-            comma = strchr (position, ',');
-            cnt++;
-        }
-		strcpy(nmea_params[cnt].str, number);
-		nmea_params[cnt].num=atoi(number);
-	return cnt;	
+	char *tok = strsep(&msg, ",");
+
+	while (tok && cnt < MAX_NMEA_PARAM) {
+		nmea_params[cnt].str = tok;
+		nmea_params[cnt].num = atoi(tok);
+		cnt++;
+		tok = strsep(&msg, ",");
+	}
+
+	return cnt;
 }
+
 static void
 nmea_process(char *a)
 {
@@ -275,28 +241,23 @@ nmea_process(char *a)
 		return;
 
 	if (nmea_verify_checksum(a)) {
-		printf("nmea message has invlid checksum\n");
+		ERROR("nmea message has invalid checksum\n");
 		return;
 	}
 
 	cnt = nmea_tokenize(&a[2]);
 	if (cnt < 0) {
-		printf("failed to tokenize %s\n", a);\
+		ERROR("failed to tokenize %s\n", a);\
 		return;
 	}
-	
-	for (i = 0; i < ARRAY_SIZE(nmea_msgs); i++) {
 
-			
-		if (strcmp(nmea_params[0].str, nmea_msgs[i].msg)){
+	for (i = 0; i < ARRAY_SIZE(nmea_msgs); i++) {
+		if (strcmp(nmea_params[0].str, nmea_msgs[i].msg))
 			continue;
-			}
-		if (nmea_msgs[i].cnt <= cnt){
+		if (nmea_msgs[i].cnt <= cnt)
 			nmea_msgs[i].handler();
-			}
-		else {
+		else
 			ERROR("%s datagram has wrong parameter count got %d but expected %d\n", nmea_msgs[i].msg, cnt, nmea_msgs[i].cnt);
-			}
 		return;
 	}
 }
@@ -306,9 +267,9 @@ nmea_consume(struct ustream *s, char **a)
 {
 	char *eol = strstr(*a, "\n");
 
-	if (!eol){
+	if (!eol)
 		return -1;
-	}
+
 	*eol++ = '\0';
 
 	nmea_process(*a);
@@ -346,7 +307,7 @@ nmea_open(char *dev, struct ustream_fd *s, speed_t speed)
 
 	tty = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
 	if (tty < 0) {
-		ERROR("%s: device open failed\n", dev);
+		ERROR("%s: device open failed: %s\n", dev, strerror(errno));
 		return -1;
 	}
 
